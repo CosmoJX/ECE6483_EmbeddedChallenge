@@ -10,6 +10,7 @@ float32_t data_array[FFT_SIZE];
 float32_t fft_out[FFT_SIZE];
 float32_t magnitude[FFT_SIZE / 2];
 float32_t SAMPLE_RATE = 104.0f; // sampling rate of accelerometer
+float32_t intensity;            // tremor/dyskinesia intensity
 
 enum symptom {NO_SYMPTOM, TREMOR, DYSKINESIA} flag;
 
@@ -33,8 +34,10 @@ int main(void) {
         show_results();
         detect_tremor_and_dyskinesia();
 
-        if (flag == TREMOR) printf("tremor detected\n");
-        else if (flag == DYSKINESIA) printf("dyskinesia detected\n");
+        if (flag == TREMOR) 
+            printf("tremor detected, intensity = %f\n", intensity);
+        else if (flag == DYSKINESIA) 
+            printf("dyskinesia detected, intensity = %f\n", intensity);
     }
 
     return 0;
