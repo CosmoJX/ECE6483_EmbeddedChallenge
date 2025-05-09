@@ -7,6 +7,7 @@ extern float32_t data_array[FFT_SIZE];
 extern float32_t fft_out[FFT_SIZE];
 extern float32_t magnitude[FFT_SIZE/2];
 extern float32_t SAMPLE_RATE;  // sampling rate of accelerometer
+extern float32_t intensity;
 
 extern arm_rfft_fast_instance_f32 FFT_Instance;
 extern enum symptom {NO_SYMPTOM, TREMOR, DYSKINESIA} flag;
@@ -41,10 +42,11 @@ void show_results() {
 void detect_tremor_and_dyskinesia() {
     // circular queue to keep track of tremor/dyskinesia symptom over time
     // sampling period of 5sec results in a detection period of 5*12 = 60sec
-    static int  t_arr[12] = {0}, k_arr[12] = {0};
+    static int t_carr[12] = {0}, k_carr[12] = {0};
+    static float32_t t_iarr[12] = {0}, k_iarr[12] = {0};
     // avoid using heap for embedded system programming
-    static CircularQueue t_queue(t_arr, 12);
-    static CircularQueue k_queue(k_arr, 12);
+    static CircularQueue t_queue(t_carr, t_iarr, 12);
+    static CircularQueue k_queue(k_carr, k_iarr, 12);
 
     float32_t resolution = SAMPLE_RATE / FFT_SIZE;
     float32_t tremor_energy = 0.0f;
@@ -73,28 +75,34 @@ void detect_tremor_and_dyskinesia() {
     // and tremor energy is above detection threshold
     if (maxFreq >= 3.0f && maxFreq <= 5.0f 
             && tremor_energy >= TREMOR_THRESHOLD) {
-        t_queue.enqueue(1);
-        k_queue.enqueue(0);
+        t_queue.enqueue(1, tremor_energy);
+        k_queue.enqueue(0, 0);
     }
+    // detected 5Hz - 7Hz as the predominant frequency, 
+    // and dyskinesia energy is above detection threshold
     else if (maxFreq > 5.0f && maxFreq <= 7.0f 
             && dyskinesia_energy >= DYSKINESIA_THRESHOLD) {
-        t_queue.enqueue(0);
-        k_queue.enqueue(1);
+        t_queue.enqueue(0, 0);
+        k_queue.enqueue(1, dyskinesia_energy);
     }
+    // no tremor or dyskinesia detected in this sampling period
     else {
-        t_queue.enqueue(0);
-        k_queue.enqueue(0);
+        t_queue.enqueue(0, 0);
+        k_queue.enqueue(0, 0);
     }
 
     // update flags
     if (t_queue.get_sum() >= 9) { // 9/12 (75%) of the past 1min, tremor is detected
         flag = TREMOR; // tremor
+        intensity = t_queue.get_intensity();
     }
     else if (k_queue.get_sum() >= 9) {
         flag = DYSKINESIA; // dyskinesia
+        intensity = k_queue.get_intensity();
     }
     else {
         flag = NO_SYMPTOM; // no symptom detected
+        intensity = 0;
     }
 
     printf("t_sum: %d, k_sum: %d\n", t_queue.get_sum(), k_queue.get_sum());
