@@ -1,0 +1,246 @@
+#include "mbed.h"
+#include "ble/BLE.h"
+#include "ble/gatt/GattService.h"
+#include "ble/gatt/GattCharacteristic.h"
+#include "ble/Gap.h"
+#include "ble/gap/AdvertisingDataBuilder.h"
+#include "events/EventQueue.h"
+#include <string.h>
+#include <vector>
+
+// initialize UART on USB
+BufferedSerial serial_port(USBTX, USBRX, 115200);
+FileHandle *mbed::mbed_override_console(int) { return &serial_port; }
+
+using namespace ble;
+using namespace events;
+using namespace std::chrono;
+
+BLE &ble_interface = BLE::Instance();  
+EventQueue event_queue;
+DigitalOut led(LED1);
+Ticker ble_check_ticker; // trigger to update data
+
+// UUIDs for the service and characteristics
+const UUID SERVICE_UUID("A0E1B2C3-D4E5-F6A7-B8C9-D0E1F2A3B4C5");
+const UUID STATE_CHAR_UUID("A1E2B3C4-D5E6-F7A8-B9C0-D1E2F3A4B5C6"); // displays state - TREMOR, STABLE, DYSKINESIA
+const UUID INTENSITY_CHAR_UUID("B1C2D3E4-F5A6-B7C8-D9E0-F1A2B3C4D5E6"); // displays intensity (32-bit value)
+
+// State Strings
+const char* STATE_STRINGS[] = { "STABLE", "TREMOR", "DYSKINESIA" };
+#define MAX_STATE_STRING_LEN 11
+
+// Intensity Values
+uint8_t StateValue[MAX_STATE_STRING_LEN];
+uint32_t IntensityValue = 0;
+
+// initialize state characteristic
+ReadOnlyArrayGattCharacteristic<uint8_t, MAX_STATE_STRING_LEN> StateCharacteristic(
+    STATE_CHAR_UUID, StateValue, GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_NOTIFY
+);
+
+// initialize intensity characteristic
+GattCharacteristic IntensityCharacteristic(
+    INTENSITY_CHAR_UUID,
+    (uint8_t*)&IntensityValue,
+    sizeof(IntensityValue),
+    sizeof(IntensityValue),
+    GattCharacteristic::BLE_GATT_CHAR_PROPERTIES_NOTIFY
+);
+
+// initialize charactersitic disiplay 
+GattCharacteristic *charTable[] = { &StateCharacteristic, &IntensityCharacteristic };
+GattService DisorderService(SERVICE_UUID, charTable, sizeof(charTable) / sizeof(charTable[0]));
+bool device_connected = false;
+
+// Display Function  
+
+void display(int flag, uint32_t intensity) {
+    if (!device_connected) {
+        printf("No device connected. Skipping BLE update.\n");
+        return;
+    }
+
+    // Clamp flag to valid range [0, 2]
+    if (flag < 0) flag = 0;
+    if (flag > 2) flag = 2;
+
+    // Update State Characteristic
+    strcpy((char*)StateValue, STATE_STRINGS[flag]);
+    ble_interface.gattServer().write(
+        StateCharacteristic.getValueHandle(), 
+        StateValue, 
+        strlen((char*)StateValue) + 1
+    );
+
+    // Update Intensity Characteristic
+    IntensityValue = intensity;
+    ble_interface.gattServer().write(
+        IntensityCharacteristic.getValueHandle(), 
+        (uint8_t*)&IntensityValue, 
+        sizeof(IntensityValue)
+    );
+
+    printf("BLE Update -> State: %s, Intensity: %lu\n", (char*)StateValue, intensity);
+    led = !led;  // Blink LED to show transmission
+}
+
+// function to be called after connection 
+void periodic_check() {
+    if (device_connected) {
+        // test code 
+        static vector<int> freq {0, 1, 2, 0, 1, 2, 0, 1, 2};
+        static vector<uint32_t> intensity_value {100, 50, 43, 25, 97, 65, 87, 97, 1};
+        static size_t index = 0;
+
+        display(freq[index], intensity_value[index]);
+        index = (index + 1) % freq.size();
+
+        // for real data, simply call the function that outputs data here, then pass freq and intensity into display
+        // eg. get_data(), display(freq, intensity);
+    } else {
+        printf("Waiting for BLE connection...\n");
+    }
+}
+class ConnectionEventHandler : public ble::Gap::EventHandler {
+public:
+    virtual void onConnectionComplete(const ble::ConnectionCompleteEvent &event) {
+        if (event.getStatus() == BLE_ERROR_NONE) {
+            printf("Device connected!\n");
+            device_connected = true;
+            ble_check_ticker.attach([]() { 
+            event_queue.call(periodic_check);  // Schedule display safely on EventQueue 
+            }, 1s);
+        }
+    }
+
+    virtual void onDisconnectionComplete(const ble::DisconnectionCompleteEvent &event) {
+        printf("Device disconnected!\n");
+        device_connected = false;
+        ble_interface.gap().startAdvertising(ble::LEGACY_ADVERTISING_HANDLE);
+        printf("Restarted advertising.\n");
+    }
+};
+
+ConnectionEventHandler connection_handler;
+
+void on_ble_init_complete(BLE::InitializationCompleteCallbackContext *params) {
+    if (params->error != BLE_ERROR_NONE) {
+        printf("BLE initialization failed.\n");
+        return;
+    }
+
+    // Initialize Characteristics
+    strcpy((char*)StateValue, "STABLE");
+    IntensityValue = 0;
+
+    ble_interface.gattServer().addService(DisorderService);
+
+    uint8_t adv_buffer[LEGACY_ADVERTISING_MAX_SIZE];
+    AdvertisingDataBuilder adv_data(adv_buffer);
+
+    adv_data.setFlags();
+    adv_data.setName("Parkinson's-Monitor");
+
+    ble_interface.gap().setAdvertisingParameters(
+        LEGACY_ADVERTISING_HANDLE,
+        AdvertisingParameters(advertising_type_t::CONNECTABLE_UNDIRECTED, adv_interval_t(160))
+    );
+
+    ble_interface.gap().setAdvertisingPayload(
+        LEGACY_ADVERTISING_HANDLE,
+        adv_data.getAdvertisingData()
+    );
+
+    ble_interface.gap().setEventHandler(&connection_handler);
+    ble_interface.gap().startAdvertising(LEGACY_ADVERTISING_HANDLE);
+
+    printf("BLE advertising started. Waiting for connection...\n");
+}
+
+void schedule_ble_events(BLE::OnEventsToProcessCallbackContext *context) {
+    event_queue.call(callback(&ble_interface, &BLE::processEvents));
+}
+
+int main() {
+    printf("Starting BLE TREMOR Disorder Monitor with Intensity...\n");
+    ble_interface.onEventsToProcess(schedule_ble_events);
+    ble_interface.init(on_ble_init_complete);
+    event_queue.dispatch_forever();
+
+}
+
+// used to change name of characteristic, too lazy to debug
+
+// static const uint8_t intensity_description[] = "Intensity";
+// GattAttribute intensityDescriptor(
+//     UUID(0x2901),  // Characteristic User Description descriptor UUID
+//     (uint8_t*)intensity_description,
+//     sizeof(intensity_description) - 1,
+//     sizeof(intensity_description) - 1,
+//     false  // Read-only descriptor
+// );
+
+
+// // scrapped, used for lcd display
+
+// // #include "mbed.h"
+// // #include "TextLCD.h"
+// // #include <vector>
+// // #include <string>
+// // using namespace std;
+
+
+
+// // // Pin names: RS, E, D4-D7
+// // TextLCD lcd(D7, D8, D9, D10, D11, D12); // 4-bit mode, 16x2 by default
+
+// // // include intensity 
+// // void set_lcd (float freq, float intensity){
+// //     lcd.cls();
+// //     // prints out frequency
+// //     int freq_whole = static_cast<int>(freq);
+// //     int freq_fraction = static_cast<int>((freq - freq_whole) * 1000); // 3 decimal places
+// //     char freq_buffer[17];
+// //     // Manually format output char string
+// //     snprintf(freq_buffer, sizeof(freq_buffer), "Freq: %d.%03d Hz", freq_whole, freq_fraction);
+
+// //     printf("%s\n", freq_buffer); // Optional serial debug
+// //     lcd.locate(0, 0);
+// //     lcd.printf("%s", freq_buffer);
+    
+// //     //  shows intensity
+// //     lcd.locate (0,1);
+// //     int int_whole = static_cast<int>(intensity);
+// //     int int_fraction = static_cast<int>((intensity - int_whole) * 1000); // 3 decimal places
+// //     char int_buffer[17];
+// //     // Manually format output char string
+// //     snprintf(int_buffer, sizeof(int_buffer), "Intensity: %d.%03d", int_whole, int_fraction);
+
+// //     printf("%s\n", int_buffer); // Optional serial debug
+// //     lcd.locate(0, 0);
+// //     lcd.printf("%s", int_buffer);
+// //     ThisThread::sleep_for(500ms);
+// //     // clears screen, then print out what state patient is in
+// //     lcd.cls();
+// //     if ((0<= freq) && (freq < 3)){
+// //         lcd.printf("Stable =)");
+// //     }
+// //     else if ((3 <= freq) && (freq < 5)){
+// //         lcd.printf("Tremor =(");
+// //     }
+// //     else if ((freq >= 5.0) && (freq <= 7.0 )){
+// //         lcd.printf("Dyskinesia =|");
+// //     }
+
+// // }   
+// // int main() {
+// //     std::vector<float> freqs = {3.15, 4.26, 5.65, 6.56, 0, 5, 8};
+// //     std::vector<float> intensity = {100, 80, 54, 32, 12, 15, 23, 43};
+// //     for (int i = 0; i < sizeof(freqs); ++i){
+// //         set_lcd(freqs[i], intensity[i]);
+// //         ThisThread::sleep_for(1000ms); 
+// //         lcd.cls();
+// //     }
+// // }
+
