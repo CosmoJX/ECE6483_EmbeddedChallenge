@@ -1,6 +1,6 @@
 #include "i2c.h"
-#include "arm_math.h"
 #include "fft.h"
+#include "arm_math.h"
 
 #define FILTER_ALPHA 0.2f
 
